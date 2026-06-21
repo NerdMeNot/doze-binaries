@@ -1,0 +1,25 @@
+# What doze-binaries builds — the cumulative catalog. Everything is explicit:
+# nothing is resolved automatically, so output is reproducible and every change
+# is a reviewable diff. This list only ever GROWS: published binaries are
+# immutable (never rebuilt or deleted), so old versions stay resolvable forever
+# and committed doze.lock files keep working. To publish new versions, ADD them
+# here and run the release workflow; it builds only what isn't already published.
+
+# Target triple -> GitHub runner. All native builds (no cross-compilation).
+triples:
+  x86_64-unknown-linux-gnu:  ubuntu-22.04
+  aarch64-unknown-linux-gnu: ubuntu-22.04-arm
+  x86_64-apple-darwin:       macos-13
+  aarch64-apple-darwin:      macos-14
+
+engines:
+  # Postgres uses its real upstream version (two-part, e.g. 16.14); the archive
+  # is named 16.14.0 and built from the REL_16_14 branch.
+  postgres:
+    versions: ["14.23", "15.18", "16.14", "17.10"]
+  valkey:
+    versions: ["8.1.8", "9.1.0"]
+  kvrocks:
+    versions: ["2.15.0"]
+  ferretdb:
+    versions: ["2.7.0"]

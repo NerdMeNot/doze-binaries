@@ -1,0 +1,191 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// config mirrors versions.yaml. Versions are explicit — dzb plan does no
+// upstream resolution. It is the cumulative catalog of everything that should
+// be published; entries are only ever added.
+type config struct {
+	Triples map[string]string `yaml:"triples"`
+	Engines map[string]struct {
+		Versions []string `yaml:"versions"`
+	} `yaml:"engines"`
+}
+
+// matrixItem is one (engine, version, triple) build job.
+type matrixItem struct {
+	Engine  string `json:"engine"`
+	Version string `json:"version"`
+	Ref     string `json:"ref"`
+	Triple  string `json:"triple"`
+	Runner  string `json:"runner"`
+}
+
+// engineRule derives, from the upstream version written in versions.yaml, the
+// three-part version used in the archive name and the source ref to build.
+type engineRule struct {
+	archiveVersion func(string) string
+	ref            func(string) string
+}
+
+// engineOrder fixes engine iteration order so the emitted matrix is deterministic.
+var engineOrder = []string{"postgres", "valkey", "kvrocks", "ferretdb"}
+
+var engineRules = map[string]engineRule{
+	// Postgres: real two-part version (16.14) -> archive 16.14.0, branch REL_16_14.
+	"postgres": {
+		archiveVersion: func(v string) string { return v + ".0" },
+		ref:            func(v string) string { return "REL_" + strings.ReplaceAll(v, ".", "_") },
+	},
+	// Valkey tags carry no leading "v".
+	"valkey": {
+		archiveVersion: func(v string) string { return v },
+		ref:            func(v string) string { return v },
+	},
+	// Kvrocks and FerretDB tags are "vX.Y.Z".
+	"kvrocks": {
+		archiveVersion: func(v string) string { return v },
+		ref:            func(v string) string { return "v" + v },
+	},
+	"ferretdb": {
+		archiveVersion: func(v string) string { return v },
+		ref:            func(v string) string { return "v" + v },
+	},
+}
+
+func runPlan() error {
+	data, err := os.ReadFile("versions.yaml")
+	if err != nil {
+		return err
+	}
+	var cfg config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parsing versions.yaml: %w", err)
+	}
+
+	// Catch typos: any engine in the config we don't know how to build.
+	for engine := range cfg.Engines {
+		if _, ok := engineRules[engine]; !ok {
+			return fmt.Errorf("unknown engine %q in versions.yaml", engine)
+		}
+	}
+
+	// Stable triple order so the emitted matrix is deterministic.
+	triples := make([]string, 0, len(cfg.Triples))
+	for t := range cfg.Triples {
+		triples = append(triples, t)
+	}
+	sort.Strings(triples)
+
+	// Already-published artifacts are immutable; never rebuild them (a rebuild
+	// would yield a different checksum and break every lockfile that pinned it).
+	published, err := publishedArtifacts()
+	if err != nil {
+		return err
+	}
+
+	include := []matrixItem{}
+	for _, engine := range engineOrder {
+		spec, ok := cfg.Engines[engine]
+		if !ok {
+			continue
+		}
+		rule := engineRules[engine]
+		for _, v := range spec.Versions {
+			full := rule.archiveVersion(v)
+			for _, t := range triples {
+				if published[key(engine, full, t)] {
+					continue // already built and frozen
+				}
+				include = append(include, matrixItem{
+					Engine: engine, Version: full, Ref: rule.ref(v),
+					Triple: t, Runner: cfg.Triples[t],
+				})
+			}
+		}
+	}
+
+	out, err := json.Marshal(struct {
+		Include []matrixItem `json:"include"`
+	}{include})
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(out))
+	return nil
+}
+
+func key(engine, full, triple string) string { return engine + "|" + full + "|" + triple }
+
+// publishedArtifacts returns the set of (engine, full, triple) already present
+// in the published manifest, so plan can skip them. The manifest location is
+// DZB_INDEX_URL (an http(s) URL or a local path), else derived from
+// GITHUB_REPOSITORY. A missing manifest (first ever run) yields an empty set.
+func publishedArtifacts() (map[string]bool, error) {
+	set := map[string]bool{}
+
+	loc := os.Getenv("DZB_INDEX_URL")
+	if loc == "" {
+		if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {
+			loc = fmt.Sprintf("https://github.com/%s/releases/download/binaries/index.json", repo)
+		}
+	}
+	if loc == "" {
+		return set, nil // no reference point: treat everything as new
+	}
+
+	var body []byte
+	if strings.HasPrefix(loc, "http") {
+		resp, err := http.Get(loc)
+		if err != nil {
+			return nil, fmt.Errorf("fetching published manifest %s: %w", loc, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return set, nil // not published yet
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("fetching published manifest %s: %s", loc, resp.Status)
+		}
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		data, err := os.ReadFile(loc)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return set, nil
+			}
+			return nil, err
+		}
+		body = data
+	}
+
+	var idx struct {
+		Engines map[string]struct {
+			Artifacts map[string]map[string]json.RawMessage `json:"artifacts"`
+		} `json:"engines"`
+	}
+	if err := json.Unmarshal(body, &idx); err != nil {
+		return nil, fmt.Errorf("parsing published manifest: %w", err)
+	}
+	for engine, e := range idx.Engines {
+		for full, triples := range e.Artifacts {
+			for triple := range triples {
+				set[key(engine, full, triple)] = true
+			}
+		}
+	}
+	return set, nil
+}

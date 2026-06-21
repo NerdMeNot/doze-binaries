@@ -1,0 +1,8 @@
+dist/
+staging/
+__pycache__/
+*.pyc
+*.tar.gz
+*.sha256
+index.json
+/dzb
