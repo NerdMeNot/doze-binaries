@@ -4,7 +4,10 @@
 # Make a macOS build relocatable: copy every Homebrew dylib the binaries link
 # into <install_dir>/lib, rewrite install names to @loader_path/../lib, and
 # ad-hoc codesign. Adapted from theseus-rs/postgresql-binaries (MIT).
-set -euo pipefail
+#
+# No pipefail: the `otool | grep <brew> | …` pipelines below legitimately match
+# nothing for binaries with no Homebrew dependencies, and that must not abort.
+set -eu
 
 INSTALL_DIR="$1"
 BREW_PREFIX="$2"

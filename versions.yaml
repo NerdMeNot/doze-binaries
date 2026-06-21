@@ -6,10 +6,11 @@
 # here and run the release workflow; it builds only what isn't already published.
 
 # Target triple -> GitHub runner. All native builds (no cross-compilation).
+# (Intel macOS / x86_64-apple-darwin is omitted: macos-13 runners are scarce and
+# Apple Silicon is the default; add it back if Intel-mac coverage is needed.)
 triples:
   x86_64-unknown-linux-gnu:  ubuntu-22.04
   aarch64-unknown-linux-gnu: ubuntu-22.04-arm
-  x86_64-apple-darwin:       macos-13
   aarch64-apple-darwin:      macos-14
 
 engines:

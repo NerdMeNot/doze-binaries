@@ -1,8 +1,8 @@
-# Build engine binaries for doze (mac + linux, x64 + arm64) and publish them,
-# with a multi-engine index.json, to a rolling `binaries` release.
-#
-# Point doze at it with, per engine:
-#   DOZE_PG_MIRROR=https://github.com/NerdMeNot/doze-binaries/releases/download/binaries
+# Build and publish doze's engine binaries. Each engine is built and published
+# independently (per-engine reusable workflow → per-engine rolling release), so a
+# slow or failing engine never blocks the others. doze consumes each engine from
+# its own release base:
+#   DOZE_<ENGINE>_MIRROR=https://github.com/NerdMeNot/doze-binaries/releases/download/<engine>
 name: release
 
 on:
@@ -15,92 +15,11 @@ permissions:
   contents: write
 
 jobs:
-  plan:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      has_work: ${{ steps.plan.outputs.has_work }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "stable"
-      # plan skips versions already in the published manifest, so only NEW
-      # (engine, version, triple) builds are scheduled — published ones are
-      # immutable and must never be rebuilt.
-      - id: plan
-        run: |
-          matrix="$(go run ./cmd/dzb plan)"
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-          if [ "$matrix" = '{"include":[]}' ]; then
-            echo "has_work=false" >> "$GITHUB_OUTPUT"
-            echo "Nothing new to build; everything in versions.yaml is already published."
-          else
-            echo "has_work=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  build:
-    needs: plan
-    if: needs.plan.outputs.has_work == 'true'
-    name: ${{ matrix.engine }} ${{ matrix.version }} (${{ matrix.triple }})
-    runs-on: ${{ matrix.runner }}
+  engine:
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        if: matrix.engine == 'ferretdb'
-        with:
-          go-version: "stable"
-      - name: Build
-        run: |
-          chmod +x scripts/*.sh recipes/*/*.sh
-          recipes/${{ matrix.engine }}/build.sh \
-            "${{ matrix.version }}" "${{ matrix.ref }}" "${{ matrix.triple }}" dist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.engine }}-${{ matrix.version }}-${{ matrix.triple }}
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    needs: [plan, build]
-    # Run even if some build jobs failed, so the binaries that did build still
-    # get published — the mirror is append-only, and later runs add the rest.
-    if: ${{ !cancelled() && needs.plan.outputs.has_work == 'true' }}
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "stable"
-      - uses: actions/download-artifact@v4
-        with:
-          path: staging
-          merge-multiple: true
-      - name: Ensure the rolling release exists
-        run: |
-          gh release create binaries \
-            --title "doze engine binaries" \
-            --notes "Prebuilt PostgreSQL, Valkey, Kvrocks and FerretDB binaries for doze (macOS + Linux, x86_64 + arm64). Append-only mirror; see index.json." \
-            2>/dev/null || true
-      - name: Assemble dist + cumulative manifest
-        run: |
-          mkdir -p dist
-          cp staging/* dist/ 2>/dev/null || true   # staging may be empty if all builds failed
-          # Merge the newly built archives into the already-published manifest so
-          # no previously published version is ever dropped.
-          gh release download binaries --pattern index.json --output existing.json 2>/dev/null || true
-          go run ./cmd/dzb manifest dist \
-            "https://github.com/${{ github.repository }}/releases/download/binaries" \
-            existing.json > dist/index.json
-          ls -l dist
-      - name: Publish (append new archives; refresh index.json only)
-        run: |
-          # New archives have unique names (never re-uploaded); only index.json
-          # is clobbered. Existing version tarballs are left untouched.
-          gh release upload binaries dist/* --clobber
+      matrix:
+        engine: [postgres, valkey, kvrocks, ferretdb]
+    uses: ./.github/workflows/build-engine.yml
+    with:
+      engine: ${{ matrix.engine }}

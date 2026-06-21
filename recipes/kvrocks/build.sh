@@ -25,7 +25,8 @@ case "$triple" in
     export CXXFLAGS="-static-libstdc++ -static-libgcc ${CXXFLAGS:-}"
     ;;
   *darwin*)
-    brew install cmake openssl@3 || true
+    # autoconf/automake/libtool are needed to build kvrocks's vendored jemalloc.
+    brew install cmake openssl@3 automake autoconf libtool || true
     ;;
 esac
 

@@ -1,0 +1,106 @@
+# Reusable workflow: build one engine for all target triples and publish it to a
+# per-engine, append-only rolling release (tag = the engine name). Called once
+# per engine by release.yml, so each engine builds and publishes independently —
+# a slow or failed engine never blocks the others.
+name: build-engine
+
+on:
+  workflow_call:
+    inputs:
+      engine:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+# Silence the macOS runners' Homebrew "untrusted taps" warning for preinstalled
+# taps (aws/tap, azure/bicep) that our builds never use.
+env:
+  HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+      # plan skips versions already in this engine's published manifest, so only
+      # NEW (version, triple) builds are scheduled — published ones are immutable.
+      - id: plan
+        run: |
+          matrix="$(go run ./cmd/dzb plan ${{ inputs.engine }})"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          if [ "$matrix" = '{"include":[]}' ]; then
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing new to build for ${{ inputs.engine }}."
+          else
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    name: ${{ matrix.version }} (${{ matrix.triple }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        if: inputs.engine == 'ferretdb'
+        with:
+          go-version: "stable"
+      - name: Build
+        run: |
+          chmod +x scripts/*.sh recipes/*/*.sh
+          recipes/${{ matrix.engine }}/build.sh \
+            "${{ matrix.version }}" "${{ matrix.ref }}" "${{ matrix.triple }}" dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.engine }}-${{ matrix.version }}-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [plan, build]
+    # Run even if some build jobs failed, so the binaries that did build still
+    # publish — the release is append-only, and later runs add the rest.
+    if: ${{ !cancelled() && needs.plan.outputs.has_work == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+      - uses: actions/download-artifact@v8
+        with:
+          path: staging
+          merge-multiple: true
+      - name: Ensure the ${{ inputs.engine }} release exists
+        run: |
+          gh release create ${{ inputs.engine }} \
+            --title "doze ${{ inputs.engine }} binaries" \
+            --notes "Prebuilt ${{ inputs.engine }} binaries for doze (macOS + Linux). Append-only mirror; see index.json." \
+            2>/dev/null || true
+      - name: Assemble dist + cumulative manifest
+        run: |
+          mkdir -p dist
+          cp staging/* dist/ 2>/dev/null || true   # staging may be empty if all builds failed
+          # Merge into this engine's already-published manifest (never drop entries).
+          gh release download ${{ inputs.engine }} --pattern index.json --output existing.json 2>/dev/null || true
+          go run ./cmd/dzb manifest dist \
+            "https://github.com/${{ github.repository }}/releases/download/${{ inputs.engine }}" \
+            existing.json > dist/index.json
+          ls -l dist
+      - name: Publish (append new archives; refresh index.json only)
+        run: gh release upload ${{ inputs.engine }} dist/* --clobber

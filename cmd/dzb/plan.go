@@ -63,7 +63,7 @@ var engineRules = map[string]engineRule{
 	},
 }
 
-func runPlan() error {
+func runPlan(args []string) error {
 	data, err := os.ReadFile("versions.yaml")
 	if err != nil {
 		return err
@@ -80,6 +80,15 @@ func runPlan() error {
 		}
 	}
 
+	// Optional engine filter — per-engine workflows pass a single engine.
+	engines := engineOrder
+	if len(args) > 0 && args[0] != "" {
+		if _, ok := engineRules[args[0]]; !ok {
+			return fmt.Errorf("unknown engine %q", args[0])
+		}
+		engines = []string{args[0]}
+	}
+
 	// Stable triple order so the emitted matrix is deterministic.
 	triples := make([]string, 0, len(cfg.Triples))
 	for t := range cfg.Triples {
@@ -87,18 +96,17 @@ func runPlan() error {
 	}
 	sort.Strings(triples)
 
-	// Already-published artifacts are immutable; never rebuild them (a rebuild
-	// would yield a different checksum and break every lockfile that pinned it).
-	published, err := publishedArtifacts()
-	if err != nil {
-		return err
-	}
-
 	include := []matrixItem{}
-	for _, engine := range engineOrder {
+	for _, engine := range engines {
 		spec, ok := cfg.Engines[engine]
 		if !ok {
 			continue
+		}
+		// Already-published artifacts are immutable; never rebuild them (a rebuild
+		// would change a checksum and break every lockfile that pinned it).
+		published, err := publishedArtifacts(engine)
+		if err != nil {
+			return err
 		}
 		rule := engineRules[engine]
 		for _, v := range spec.Versions {
@@ -131,13 +139,13 @@ func key(engine, full, triple string) string { return engine + "|" + full + "|" 
 // in the published manifest, so plan can skip them. The manifest location is
 // DZB_INDEX_URL (an http(s) URL or a local path), else derived from
 // GITHUB_REPOSITORY. A missing manifest (first ever run) yields an empty set.
-func publishedArtifacts() (map[string]bool, error) {
+func publishedArtifacts(engine string) (map[string]bool, error) {
 	set := map[string]bool{}
 
 	loc := os.Getenv("DZB_INDEX_URL")
 	if loc == "" {
 		if repo := os.Getenv("GITHUB_REPOSITORY"); repo != "" {
-			loc = fmt.Sprintf("https://github.com/%s/releases/download/binaries/index.json", repo)
+			loc = fmt.Sprintf("https://github.com/%s/releases/download/%s/index.json", repo, engine)
 		}
 	}
 	if loc == "" {

@@ -22,7 +22,7 @@ func main() {
 	var err error
 	switch os.Args[1] {
 	case "plan":
-		err = runPlan()
+		err = runPlan(os.Args[2:])
 	case "manifest":
 		err = runManifest(os.Args[2:])
 	default:
