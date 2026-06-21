@@ -7,6 +7,7 @@
 set -euo pipefail
 
 version="$1"; ref="$2"; triple="$3"; out="${4:-dist}"
+mkdir -p "$out"; out="$(cd "$out" && pwd)"   # absolute, so output survives later cd
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 prefix="$(mktemp -d)/valkey"
 src="$(mktemp -d)/src"
