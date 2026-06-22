@@ -92,6 +92,13 @@ curl -fsSL https://download.osgeo.org/postgis/source/postgis-3.6.0.tar.gz -o "$s
 mkdir -p "$src/postgis" && tar xzf "$src/postgis.tgz" -C "$src/postgis" --strip-components=1
 ( cd "$src/postgis"
   ./configure --prefix="$prefix" --with-pgconfig="$PGC" --without-raster --without-protobuf
+  # Even with raster disabled, extensions/postgis's install SQL depends on
+  # sql/raster_unpackage.sql, whose recipe unconditionally runs
+  # `make -C ../../raster/rt_pg sql_objs` — which fails (the raster lib was never
+  # built). It's a -j race: x86_64 dodged it, arm64 didn't. Stub that target to
+  # emit EMPTY drop scripts so raster_unpackage.sql builds to a no-op. A fresh
+  # CREATE EXTENSION postgis never needs the raster-unpackage path.
+  printf 'sql_objs:\n\t@touch rtpostgis_drop.sql rtpostgis_upgrade_cleanup.sql uninstall_rtpostgis.sql\n.DEFAULT:\n\t@true\n' > raster/rt_pg/Makefile
   make -j"$ncpu" -C liblwgeom
   [ -d deps ] && make -j"$ncpu" -C deps || true
   make -j"$ncpu" -C libpgcommon
