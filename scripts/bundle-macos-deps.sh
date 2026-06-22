@@ -20,10 +20,29 @@ set -eu
 INSTALL_DIR="$1"
 BREW_PREFIX="${2:-}"
 [ -n "$INSTALL_DIR" ] || { echo "usage: $0 <install_dir> [brew_prefix]"; exit 1; }
-INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
+# pwd -P resolves symlinks so INSTALL_DIR matches the canonical paths realpath_of
+# returns (macOS /tmp -> /private/tmp, /var -> /private/var); otherwise the
+# "already inside the tree" prefix test fails and in-tree extension libs under
+# lib/postgresql/ get wrongly re-bundled (flattened) into lib/.
+INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
 mkdir -p "$INSTALL_DIR/lib"
 
 realpath_of() { python3 -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$1"; }
+
+# loader_prefix echoes the @loader_path-relative prefix that reaches
+# <install_dir>/lib from the directory holding the Mach-O passed as $1. A file in
+# bin/ or lib/ is one level under the tree root, so "../lib/"; an extension in
+# lib/postgresql/ is two, so "../../lib/". Computed from depth so any nesting
+# works — needed now that we rewrite the extension dylibs under lib/postgresql/.
+loader_prefix() {
+  local dir rel ups part
+  dir="$(cd "$1" && pwd)"
+  rel="${dir#"$INSTALL_DIR"/}"
+  ups=""
+  local IFS=/
+  for part in $rel; do ups="../$ups"; done
+  echo "@loader_path/${ups}lib/"
+}
 
 is_system() {
   case "$1" in
@@ -35,19 +54,27 @@ is_system() {
 # Resolve a (possibly @loader_path/@rpath/relative) dependency reference, recorded
 # in a file living at <origin_dir>, to an absolute real path on disk.
 resolve_dep() {
-  local ref="$1" origin_dir="$2" cand=""
+  local ref="$1" origin_dir="$2" cand="" base
+  base="$(basename "$ref")"
   case "$ref" in
-    @loader_path/*|@executable_path/*)
-      cand="$origin_dir/${ref#@*/}" ;;
-    @rpath/*)
-      local base="${ref#@rpath/}" d
-      for d in "$origin_dir" "$origin_dir/../lib" "$INSTALL_DIR/lib" "$BREW_PREFIX/lib"; do
-        [ -n "$d" ] && [ -e "$d/$base" ] && { cand="$d/$base"; break; }
-      done
-      cand="${cand:-$BREW_PREFIX/lib/$base}" ;;
-    /*) cand="$ref" ;;
-    *)  cand="$origin_dir/$ref" ;;
+    @loader_path/*|@executable_path/*) cand="$origin_dir/${ref#@*/}" ;;
+    @rpath/*)                          cand="" ;;   # resolved by the tree search below
+    /*)                                cand="$ref" ;;
+    *)                                 cand="$origin_dir/$ref" ;;
   esac
+  # If the candidate isn't a real file — a @rpath ref, or an absolute reference
+  # into a build prefix that no longer exists (an extension dylib that recorded
+  # $TMP/.../lib/libpq.5.dylib, or a documentdb lib re-exporting a sibling by its
+  # build-time install_name) — recover by basename. Search the tree FIRST, and
+  # lib/postgresql/ before lib/ so a sibling extension (e.g. pg_documentdb_core)
+  # resolves to its real home and is never duplicated into lib/.
+  if [ -z "$cand" ] || [ ! -e "$cand" ]; then
+    local d
+    for d in "$INSTALL_DIR/lib/postgresql" "$INSTALL_DIR/lib" "$origin_dir" "$BREW_PREFIX/lib"; do
+      [ -n "$d" ] && [ -e "$d/$base" ] && { cand="$d/$base"; break; }
+    done
+    cand="${cand:-$BREW_PREFIX/lib/$base}"
+  fi
   realpath_of "$cand"
 }
 
@@ -60,10 +87,13 @@ resolve_dep() {
 # (so ICU's @loader_path/libicudata still points at the real file to copy), not
 # the copy's new home — hence the explicit second argument.
 rewrite() {
-  local file="$1" origin="${2:-}" self dep resolved name
+  local file="$1" origin="${2:-}" self dep resolved sub prefix
   file "$file" | grep -q "Mach-O" || return 0
   self="$(realpath_of "$file")"
   [ -n "$origin" ] || origin="$(dirname "$file")"
+  # Prefix that reaches the tree's lib/ from THIS file's directory (bin/, lib/, or
+  # lib/postgresql/ all differ in depth).
+  prefix="$(loader_prefix "$(dirname "$file")")"
   # Skip the first otool line (the file header); the lib's own id is filtered by
   # the self-comparison below.
   while read -r dep; do
@@ -72,11 +102,14 @@ rewrite() {
     resolved="$(resolve_dep "$dep" "$origin")"
     [ "$resolved" = "$self" ] && continue          # the file's own id
     case "$resolved" in
-      "$INSTALL_DIR"/*) name="$(basename "$resolved")" ;;   # already inside the tree
-      *) name="$(bundle "$resolved")" ;;                    # external → copy in
+      "$INSTALL_DIR"/lib/*) sub="${resolved#"$INSTALL_DIR"/lib/}" ;; # already in tree (lib/ or lib/postgresql/)
+      "$INSTALL_DIR"/*)     continue ;;                              # in-tree but not a lib — leave alone
+      *)                    sub="$(bundle "$resolved")" ;;           # external → copy into lib/
     esac
-    [ -n "$name" ] || continue
-    install_name_tool -change "$dep" "@loader_path/../lib/$name" "$file" 2>/dev/null || true
+    [ -n "$sub" ] || continue
+    # @loader_path/<ups>lib/<sub>: <sub> keeps the postgresql/ segment for sibling
+    # extension references so they resolve to lib/postgresql/, not lib/.
+    install_name_tool -change "$dep" "${prefix}${sub}" "$file" 2>/dev/null || true
   done < <(otool -L "$file" | tail -n +2 | awk '{print $1}')
 }
 
@@ -97,10 +130,19 @@ bundle() {
   echo "$name"
 }
 
-# Roots: every Mach-O in bin/ and every real (non-symlink) dylib already in lib/.
+# Roots: every Mach-O in bin/ and every real (non-symlink) dylib anywhere under
+# lib/ — including the extension modules in lib/postgresql/, whose build-time
+# references to libpq and to sibling documentdb libs must be relocated too.
 while IFS= read -r b; do rewrite "$b"; done < <(find "$INSTALL_DIR/bin" -type f 2>/dev/null)
-while IFS= read -r l; do [ -L "$l" ] || rewrite "$l"; done \
-  < <(find "$INSTALL_DIR/lib" -maxdepth 1 -name "*.dylib" 2>/dev/null)
+while IFS= read -r l; do
+  [ -L "$l" ] && continue
+  rewrite "$l"
+  # Strip the build-prefix install id (LC_ID_DYLIB). Every real reference is
+  # already rewritten to a @loader_path path, so the id is otherwise unused — but
+  # leaving the build-tmp path in it ships a dangling absolute path and trips the
+  # smoke relocation check. @rpath/<name> is the conventional relocatable id.
+  install_name_tool -id "@rpath/$(basename "$l")" "$l" 2>/dev/null || true
+done < <(find "$INSTALL_DIR/lib" -name "*.dylib" 2>/dev/null)
 
 # Ad-hoc sign everything we touched (required on Apple Silicon).
 find "$INSTALL_DIR/bin" "$INSTALL_DIR/lib" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do

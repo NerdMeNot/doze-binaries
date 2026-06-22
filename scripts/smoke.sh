@@ -34,6 +34,39 @@ dir="$(find "$work" -maxdepth 1 -mindepth 1 -type d | head -n1)"
 
 run() { echo "  smoke: $*"; "$@" >/dev/null; }
 
+# check_relocation fails if any bundled library still points OUTSIDE the package —
+# the failure mode the runtime test alone can miss, because the build prefix still
+# exists on the build machine, so an extension that recorded an absolute build-tmp
+# path to libpq/geos still loads HERE but breaks on a user's machine. This walks
+# every dylib/so (including the extension modules under lib/postgresql/) and
+# rejects any non-system, non-@loader_path/@rpath/$ORIGIN dependency.
+check_relocation() {
+  local root="$1" bad=0 lib ref
+  case "$(uname -s)" in
+    Darwin)
+      while IFS= read -r lib; do
+        while IFS= read -r ref; do
+          case "$ref" in
+            /usr/lib/*|/System/*|@loader_path/*|@rpath/*|@executable_path/*) ;;
+            /*) echo "  RELOC FAIL: $(basename "$lib") -> $ref"; bad=1 ;;
+          esac
+        done < <(otool -L "$lib" 2>/dev/null | tail -n +2 | awk '{print $1}')
+      done < <(find "$root/lib" -name '*.dylib' 2>/dev/null)
+      ;;
+    Linux)
+      while IFS= read -r lib; do
+        if ldd "$lib" 2>/dev/null | grep -q 'not found'; then
+          echo "  RELOC FAIL: $(basename "$lib") has unresolved deps:"
+          ldd "$lib" 2>/dev/null | grep 'not found'
+          bad=1
+        fi
+      done < <(find "$root/lib" -name '*.so*' -type f 2>/dev/null)
+      ;;
+  esac
+  [ "$bad" = 0 ] || { echo "smoke: relocation check failed — bundled libs reference paths outside the package"; exit 1; }
+  echo "  smoke: relocation check ok"
+}
+
 case "$engine" in
   postgres)
     run "$dir/bin/postgres" --version
@@ -54,6 +87,9 @@ case "$engine" in
     run "$dir/bin/ferretdb" --version
     ;;
   documentdb)
+    # First prove every bundled lib is self-contained (catches the build-tmp libpq
+    # / unbundled geos relocation bug that a same-machine runtime test misses).
+    check_relocation "$dir"
     # Stand up the relocated Postgres, load the extension, and do a real
     # documentdb_api insert/count — the whole point of this artifact.
     data="$work/data"; sock="$work/sock"; mkdir -p "$sock"

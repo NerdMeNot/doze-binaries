@@ -31,7 +31,10 @@ collect() {
   done
 }
 
-elf_files() { find "$prefix/bin" "$prefix/lib" -maxdepth 1 -type f 2>/dev/null; }
+# Every ELF in bin/ and ANYWHERE under lib/ — including the extension modules in
+# lib/postgresql/, whose build-time deps (libpq, geos, proj, sibling documentdb
+# libs) must be bundled and whose rpath must be relocated too.
+elf_files() { find "$prefix/bin" "$prefix/lib" -type f 2>/dev/null; }
 
 # Two passes so transitive deps of freshly bundled libs are also captured.
 for pass in 1 2; do
@@ -41,9 +44,24 @@ for pass in 1 2; do
   done < <(elf_files)
 done
 
+# rpath_for echoes a depth-aware rpath for an ELF: $ORIGIN (so a sibling
+# extension in the same dir resolves) plus the relative hop up to <prefix>/lib.
+# A file in bin/ or lib/ is one level under the tree root ($ORIGIN/../lib); an
+# extension in lib/postgresql/ is two ($ORIGIN/../../lib) — a flat $ORIGIN/../lib
+# would resolve to lib/lib from there and find nothing.
+rpath_for() {
+  local dir rel ups part
+  dir="$(cd "$(dirname "$1")" && pwd)"
+  rel="${dir#"$prefix"/}"
+  ups=""
+  local IFS=/
+  for part in $rel; do ups="../$ups"; done
+  echo "\$ORIGIN:\$ORIGIN/${ups}lib"
+}
+
 while IFS= read -r f; do
   file "$f" | grep -q ELF || continue
-  patchelf --set-rpath '$ORIGIN/../lib' "$f" 2>/dev/null || true
+  patchelf --set-rpath "$(rpath_for "$f")" "$f" 2>/dev/null || true
 done < <(elf_files)
 
 echo "bundled linux deps into $prefix/lib"
