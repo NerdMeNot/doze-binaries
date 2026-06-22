@@ -17,7 +17,7 @@ engines:
   # Postgres uses its real upstream version (two-part, e.g. 16.14); the archive
   # is named 16.14.0 and built from the REL_16_14 branch.
   postgres:
-    versions: ["14.23", "15.18", "16.14", "17.10"]
+    versions: ["14.23", "15.18", "16.14", "17.10", "18.4"]
   valkey:
     versions: ["8.1.8", "9.1.0"]
   kvrocks:

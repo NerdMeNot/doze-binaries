@@ -53,6 +53,28 @@ case "$engine" in
   ferretdb)
     run "$dir/bin/ferretdb" --version
     ;;
+  documentdb)
+    # Stand up the relocated Postgres, load the extension, and do a real
+    # documentdb_api insert/count — the whole point of this artifact.
+    data="$work/data"; sock="$work/sock"; mkdir -p "$sock"
+    run "$dir/bin/initdb" -D "$data" -U postgres --no-sync -E UTF8 --locale=C
+    cat >> "$data/postgresql.conf" <<EOF
+listen_addresses = ''
+unix_socket_directories = '$sock'
+port = 5499
+shared_preload_libraries = 'pg_cron,pg_documentdb_core,pg_documentdb'
+cron.database_name = 'postgres'
+EOF
+    "$dir/bin/pg_ctl" -D "$data" -l "$work/pg.log" -w start || { echo "smoke: server failed"; cat "$work/pg.log"; exit 1; }
+    psql() { "$dir/bin/psql" -h "$sock" -p 5499 -U postgres -d postgres -v ON_ERROR_STOP=1 -tA "$@"; }
+    echo "  smoke: CREATE EXTENSION documentdb CASCADE"
+    psql -c "CREATE EXTENSION documentdb CASCADE;" >/dev/null
+    psql -c "SELECT documentdb_api.binary_extended_version();" >/dev/null
+    psql -c "SELECT documentdb_api.insert_one('smoke','c','{\"_id\":1,\"ok\":true}');" >/dev/null
+    n="$(psql -c "SELECT documentdb_api.count_query('smoke','{\"count\":\"c\"}');")"
+    "$dir/bin/pg_ctl" -D "$data" stop -m immediate >/dev/null 2>&1 || true
+    echo "  smoke: documentdb insert/count ok ($n)"
+    ;;
   *)
     # Unknown engine: at least prove every binary loads (dyld/ld resolves deps).
     for b in "$dir"/bin/*; do [ -x "$b" ] && run "$b" --version || true; done
