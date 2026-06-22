@@ -31,8 +31,11 @@ type manifest struct {
 }
 
 // archiveName captures engine, full version, and triple. "postgresql" is
-// normalised to "postgres" to match doze's engine naming.
-var archiveName = regexp.MustCompile(`^(postgresql|valkey|kvrocks|ferretdb)-(\d+\.\d+\.\d+)-(.+)\.tar\.gz$`)
+// normalised to "postgres" to match doze's engine naming. The version is matched
+// loosely (.+) and the triple is anchored to a known arch+os tail: documentdb's
+// version itself contains a dash (e.g. 0.112-0), so a fixed dotted pattern can't
+// be used and the triple boundary must be pinned instead.
+var archiveName = regexp.MustCompile(`^(postgresql|valkey|kvrocks|ferretdb|documentdb)-(.+)-((?:aarch64|x86_64)-(?:apple-darwin|unknown-linux-gnu))\.tar\.gz$`)
 
 // runManifest builds the multi-engine index.yaml. It is CUMULATIVE: if an
 // existing manifest is given, newly built archives are merged into it and no
